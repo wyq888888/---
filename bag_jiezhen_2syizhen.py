@@ -1,3 +1,10 @@
+"""
+RealSense D435 .bag 文件 RGB/Depth 帧提取工具
+功能：按 2 秒间隔读取 .bag 文件，提取 RGB 帧和对应深度数据，按时间戳命名
+依赖：pyrealsense2, opencv-python, numpy
+"""
+
+
 import argparse
 import ctypes
 import os
@@ -116,20 +123,14 @@ def _save_color_and_depth_frames(bag_path: Path, output_dir: Path, interval_seco
 
 			color_image_bgr = _frame_to_bgr(color_frame)
 			depth_image = np.asanyarray(depth_frame.get_data())
-			depth_vis = cv2.applyColorMap(
-				cv2.convertScaleAbs(depth_image, alpha=0.03),
-				cv2.COLORMAP_JET,
-			)
 
 			time_ms = int(round(timestamp_ms - first_timestamp_ms))
 			file_stem = f"frame_{saved_count:05d}_t{time_ms:07d}ms"
 
 			color_path = rgb_dir / f"{file_stem}.png"
-			depth_vis_path = depth_dir / f"{file_stem}.png"
 			depth_raw_path = depth_dir / f"{file_stem}.npy"
 
 			_save_image_unicode(color_path, color_image_bgr)
-			_save_image_unicode(depth_vis_path, depth_vis)
 			np.save(depth_raw_path, depth_image)
 
 			saved_count += 1
@@ -142,9 +143,7 @@ def _save_color_and_depth_frames(bag_path: Path, output_dir: Path, interval_seco
 
 
 def main() -> None:
-	parser = argparse.ArgumentParser(
-		description="Extract RealSense D435 bag frames every 2 seconds and save them"
-	)
+	parser = argparse.ArgumentParser(description="按 2 秒间隔从 RealSense D435 .bag 文件中提取 RGB/Depth 帧")
 	parser.add_argument(
 		"--bag",
 		nargs="?",
@@ -166,7 +165,7 @@ def main() -> None:
 
 	bag_path = Path(args.bag).expanduser()
 	if not args.bag:
-		raise ValueError("请提供 .bag 文件路径，例如: python bag_tes.py your_file.bag")
+		raise ValueError("请提供 .bag 文件路径，例如: python bag_jiezhen_2syizhen.py your_file.bag")
 
 	if not bag_path.exists() or bag_path.suffix.lower() != ".bag":
 		raise FileNotFoundError(f"未找到有效的 .bag 文件: {bag_path}")
