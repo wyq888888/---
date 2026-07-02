@@ -2,7 +2,7 @@
 
 输入 RGB 图和对应深度图，使用 `tape.pt` 做 YOLOv8-OBB 推理，
 输出每个目标的四个角点，以及下边/左边对应的两点。
-同时根据检测框中心点采样深度，过滤掉深度偏差超过 5cm 的 RGB 像素。
+同时根据检测框中心点采样深度执行过滤处理（内部使用，不在输出层返回过滤图）。
 """
 
 from __future__ import annotations
@@ -201,21 +201,26 @@ def _pick_edge(points: np.ndarray, mode: str) -> dict[str, list[list[float]]]:
 
 def detect_tape_edges(
     image_or_path: str | Path | np.ndarray,
-    depth_or_path: str | Path | np.ndarray,
+    depth_or_path: str | Path | np.ndarray | None = None,
     weights_path: str | Path = DEFAULT_WEIGHTS,
     conf: float = 0.25,
     imgsz: int = 640,
 ) -> dict[str, Any]:
-    """返回 tape 目标的下边/左边两点信息，以及深度过滤后的 RGB 图。"""
+    """返回 tape 目标的下边/左边两点信息。"""
     image = _load_image(image_or_path)
-    depth_map = _load_depth(depth_or_path)
-    depth_map = _ensure_depth_shape(depth_map, image.shape[0], image.shape[1])
-    depth_map_m = _depth_to_meters(depth_map)
+    depth_map_m = None
+    if depth_or_path is not None and str(depth_or_path) != "":
+        depth_map = _load_depth(depth_or_path)
+        depth_map = _ensure_depth_shape(depth_map, image.shape[0], image.shape[1])
+        depth_map_m = _depth_to_meters(depth_map)
     model = _load_model(weights_path)
 
     results = model.predict(source=image, conf=conf, imgsz=imgsz, verbose=False, show=False)
     if not results:
-        return []
+        return {
+            "detections": [],
+            "selected_detection": None,
+        }
 
     result = results[0]
     image_height, image_width = image.shape[:2]
@@ -245,20 +250,19 @@ def detect_tape_edges(
             "left_edge": left_edge,
         })
 
-    filtered_rgb = image.copy()
     selected_detection = None
     if detections:
         selected_detection = detections[0]
         selected_polygon = polygons[0]
-        center_x, center_y = _polygon_center(selected_polygon)
-        filtered_rgb, center_depth_m = _filter_rgb_by_depth(image, depth_map_m, center_x, center_y, tolerance_m=DEPTH_TOLERANCE_M)
-        selected_detection["center"] = [center_x, center_y]
-        selected_detection["center_depth_m"] = center_depth_m
-        selected_detection["depth_tolerance_m"] = DEPTH_TOLERANCE_M
+        if depth_map_m is not None:
+            center_x, center_y = _polygon_center(selected_polygon)
+            _, center_depth_m = _filter_rgb_by_depth(image, depth_map_m, center_x, center_y, tolerance_m=DEPTH_TOLERANCE_M)
+            selected_detection["center"] = [center_x, center_y]
+            selected_detection["center_depth_m"] = center_depth_m
+            selected_detection["depth_tolerance_m"] = DEPTH_TOLERANCE_M
 
     return {
         "detections": detections,
-        "filtered_rgb": filtered_rgb,
         "selected_detection": selected_detection,
     }
 
@@ -276,7 +280,6 @@ def main() -> None:
     printable = {
         "detections": result["detections"],
         "selected_detection": result["selected_detection"],
-        "filtered_rgb_shape": list(result["filtered_rgb"].shape) if result["filtered_rgb"] is not None else None,
     }
     print(json.dumps(printable, ensure_ascii=False, indent=2))
 

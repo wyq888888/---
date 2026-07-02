@@ -79,8 +79,15 @@ def draw_shifted_bottom_edge(image, tape_edges, shift_pixels=10):
         return overlay
 
     item = tape_edges[0]
+    left_points = item["left_edge"]["points"]
     bottom_points = item["bottom_edge"]["points"]
     shifted_points = _shift_edge_down(bottom_points, shift_pixels, image_height)
+
+    if len(left_points) == 2:
+        p1 = (int(round(float(left_points[0][0]))), int(round(float(left_points[0][1]))))
+        p2 = (int(round(float(left_points[1][0]))), int(round(float(left_points[1][1]))))
+        cv2.line(overlay, p1, p2, (255, 0, 0), 2, cv2.LINE_AA)
+
     if len(shifted_points) == 2:
         cv2.line(overlay, shifted_points[0], shifted_points[1], (0, 0, 255), 2, cv2.LINE_AA)
 
@@ -111,9 +118,11 @@ def crop_roi_from_edges(image, top_points, shifted_points, padding_x=20, padding
 def preprocess_roi(roi_image):
     gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
     denoised = cv2.medianBlur(gray, MEDIAN_KERNEL_SIZE)
-    scharr_x = cv2.Scharr(denoised, cv2.CV_64F, dx=1, dy=0)
-    scharr_x = cv2.convertScaleAbs(scharr_x)
-    return gray, denoised, scharr_x
+    sobel_x = cv2.Sobel(denoised, cv2.CV_64F, dx=1, dy=0, ksize=3)
+    abs_sobel_x = cv2.convertScaleAbs(sobel_x)
+    normalized = cv2.normalize(abs_sobel_x, None, 0, 255, cv2.NORM_MINMAX)
+    _, binary_edges = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return gray, denoised, normalized, binary_edges
 
 
 def preprocess(image):
@@ -197,9 +206,9 @@ def main():
     parser.add_argument("--imgsz", type=int, default=640, help="推理尺寸")
     args = parser.parse_args()
 
+    image = load_image(args.rgb)
     tape_result = detect_tape_edges(args.rgb, args.depth, weights_path=args.weights, conf=args.conf, imgsz=args.imgsz)
     tape_edges = tape_result["detections"]
-    image = tape_result["filtered_rgb"]
 
     if tape_edges:
         print("[tape] 识别到目标，输出下边/左边两点：")
@@ -219,19 +228,132 @@ def main():
     if tape_edges:
         bottom_points = tape_edges[0]["bottom_edge"]["points"]
         shifted_points = _shift_edge_down(bottom_points, 10, image.shape[0])
-        roi_image, roi_bbox = crop_roi_from_edges(image, bottom_points, shifted_points, padding_x=15, padding_y=10)
+        roi_image, roi_bbox = crop_roi_from_edges(image, bottom_points, shifted_points, padding_x=1, padding_y=1)
         if roi_image.size != 0:
-            roi_gray, roi_denoised, roi_edges = preprocess_roi(roi_image)
+            roi_gray, roi_denoised, roi_edges, roi_binary_edges = preprocess_roi(roi_image)
+            # ── 在二值图中找左侧（x最小）值为255的所有点，求平均点 ──
+            white_coords = np.column_stack(np.where(roi_binary_edges == 255))
+            if len(white_coords) > 0:
+                min_x = white_coords[:, 1].min()
+                left_white = white_coords[white_coords[:, 1] == min_x]
+                mean_y = int(round(left_white[:, 0].mean()))
+                mean_x = int(round(left_white[:, 1].mean()))
+                print(f"[ROI左侧边缘平均点] (x0, y0) = ({mean_x}, {mean_y})  共 {len(left_white)} 个左侧白点")
+                mean_point = (mean_x, mean_y)
+
+                # ── 左边缘：最上点 / 最下点 ──
+                top_pt = left_white[left_white[:, 0].argmin()]   # (y, x) 行最小
+                bot_pt = left_white[left_white[:, 0].argmax()]   # (y, x) 行最大
+                top_pt_xy = (int(top_pt[1]), int(top_pt[0]))
+                bot_pt_xy = (int(bot_pt[1]), int(bot_pt[0]))
+
+                # 左边缘方向向量 v = bot - top
+                v = np.array([bot_pt_xy[0] - top_pt_xy[0], bot_pt_xy[1] - top_pt_xy[1]], dtype=float)
+                # 垂直向量 v_perp （点积为0），指向右侧
+                v_perp = np.array([v[1], -v[0]], dtype=float)
+                if v_perp[0] < 0:   # 确保 x 分量为正（指向右侧）
+                    v_perp = -v_perp
+                v_perp_norm = v_perp / (np.linalg.norm(v_perp) + 1e-12)
+
+                # 从均值点沿垂线方向步进，寻找右侧交于值为255的点
+                h, w = roi_binary_edges.shape
+                # 只考虑图片右半部分（x > w/2）的白点
+                right_white = white_coords[white_coords[:, 1] > w // 2]
+                right_cross = None
+                if len(right_white) > 0:
+                    # 沿垂线方向步进，寻找右侧交点
+                    t = 0
+                    step = 0.5
+                    # 沿垂线步进，收集右侧所有穿过的白点
+                    hit_points = []
+                    while True:
+                        t += step
+                        cx = mean_x + v_perp_norm[0] * t
+                        cy = mean_y + v_perp_norm[1] * t
+                        ix, iy = int(round(cx)), int(round(cy))
+                        if ix >= w or iy < 0 or iy >= h:
+                            break
+                        if ix > w // 2 and roi_binary_edges[iy, ix] == 255:
+                            hit_points.append((ix, iy))
+
+                    if hit_points:
+                        # 取所有命中点的平均值
+                        xs = [p[0] for p in hit_points]
+                        ys = [p[1] for p in hit_points]
+                        avg_x = int(round(sum(xs) / len(xs)))
+                        avg_y = int(round(sum(ys) / len(ys)))
+                        right_cross = (avg_x, avg_y)
+                        print(f"[ROI右侧交点] 沿垂线命中 {len(hit_points)} 个点，平均点 (x, y) = ({avg_x}, {avg_y})")
+                    else:
+                        # 步进没命中，在右半部分白点中找距离垂线最近的点
+                        p0 = np.array([mean_x, mean_y], dtype=float)
+                        v_len = np.linalg.norm(v)
+                        distances = []
+                        for yx in right_white:
+                            p = np.array([float(yx[1]), float(yx[0])], dtype=float)
+                            cross_dist = abs(np.cross(p - p0, v_perp)) / v_len
+                            distances.append((cross_dist, (int(yx[1]), int(yx[0]))))
+                        distances.sort(key=lambda d: d[0])
+                        # 取距离最小的前 N 个点做平均
+                        top_n = min(5, len(distances))
+                        avg_x = int(round(sum(d[1][0] for d in distances[:top_n]) / top_n))
+                        avg_y = int(round(sum(d[1][1] for d in distances[:top_n]) / top_n))
+                        right_cross = (avg_x, avg_y)
+                        print(f"[ROI右侧最近点] 取前{top_n}个最近点平均 (x, y) = ({avg_x}, {avg_y})  最近距离={distances[0][0]:.1f}")
+
+                cross_point = right_cross
+            else:
+                print("[ROI] 二值图中无白点")
+                mean_point = None
+                cross_point = None
+
+            # ── 在原始二值图上将均值点和右侧交点周围3×3区域设为255（白色显示） ──
+            if mean_point is not None:
+                my, mx = mean_point[1], mean_point[0]
+                roi_binary_edges[max(0,my-1):my+2, max(0,mx-1):mx+2] = 255
+            if cross_point is not None:
+                cy, cx = cross_point[1], cross_point[0]
+                roi_binary_edges[max(0,cy-1):cy+2, max(0,cx-1):cx+2] = 255
+
+            # ── 将ROI坐标还原到原图，计算像素长度和物理长度 ──
+            if mean_point is not None and cross_point is not None:
+                # ROI坐标 → 原图坐标
+                left_pt_global = (mean_point[0] + roi_bbox[0], mean_point[1] + roi_bbox[1])
+                right_pt_global = (cross_point[0] + roi_bbox[0], cross_point[1] + roi_bbox[1])
+
+                # 左右两点像素长度
+                dx_lr = right_pt_global[0] - left_pt_global[0]
+                dy_lr = right_pt_global[1] - left_pt_global[1]
+                pixel_len_lr = np.sqrt(dx_lr**2 + dy_lr**2)
+
+                # "左边"两点取自OBB检测的left_edge（在原图上，直接使用）
+                left_edge_pts = tape_edges[0]["left_edge"]["points"]
+                p1 = (int(round(left_edge_pts[0][0])), int(round(left_edge_pts[0][1])))
+                p2 = (int(round(left_edge_pts[1][0])), int(round(left_edge_pts[1][1])))
+                dx_left = p2[0] - p1[0]
+                dy_left = p2[1] - p1[1]
+                pixel_len_left = np.sqrt(dx_left**2 + dy_left**2)
+
+                # 已知左边真实长度 = 18mm，比例法求左右两点真实物理长度
+                LEFT_REAL_MM = 18.0
+                real_len_lr = (pixel_len_lr / pixel_len_left) * LEFT_REAL_MM
+
+                print(f"[原图坐标] 左侧均值点: {left_pt_global}  右侧交点: {right_pt_global}")
+                print(f"[原图坐标] left_edge两点: {p1} {p2}")
+                print(f"[像素长度] 左右两点: {pixel_len_lr:.2f} px  左边(left_edge)两点: {pixel_len_left:.2f} px")
+                print(f"[物理长度] 左边真实长度={LEFT_REAL_MM}mm → 左右两点真实长度={real_len_lr:.2f}mm")
+
             roi_edge_window = cv2.resize(
-                roi_edges,
+                roi_binary_edges,
                 None,
                 fx=4.0,
                 fy=4.0,
                 interpolation=cv2.INTER_CUBIC,
             )
+            # 所有辅助标记已移除，仅在二值图上保留白色点（已在resize前设为255）
 
     print(f"[信息] 图片尺寸: {image.shape[1]}×{image.shape[0]}")
-    print(f"[参数] 仅绘制下边向下平移10像素后的红线")
+    print(f"[参数] 绘制左边蓝线 + 下边向下平移10像素后的红线")
 
     # 保存结果
     save_path = "edge_result.png"
